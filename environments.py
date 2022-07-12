@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 #
-# Copyright 2021 Giorgio Angelotti
+# Copyright 2022 Giorgio Angelotti
 #
 # This file is part of EvC.
 #
@@ -20,6 +20,8 @@
 
 import numpy as np
 import gym
+import pandas as pd
+import os
 
 
 # ENVIRONMENT CLASS, CONTAINS THE FOLLOWING VARIABLES
@@ -31,7 +33,9 @@ import gym
 # Also contains the method: generate_trajectory(number, length) which generate number trajectories
 # with a fixed length while following a random policy.
 class Ring:
-    def __init__(self):
+    def __init__(self, idd=None):
+        self.idd = idd
+        self.envname = "ring"
         self.actions = 3
         self.states = 5
         self.T = np.zeros((3, 5, 5))
@@ -87,7 +91,9 @@ class Ring:
         self.init = np.eye(self.states, dtype=np.float64)[0]
 
     #
-    def generate_trajectories(self, number, length):
+    def generate_trajectories(self, number, length, id1=None, id2=None):
+        column_names = ["idstatefrom", "idaction", "idstateto", "reward", "step", "episode"]
+        data = pd.DataFrame(columns=column_names)
         history = []
         trajectories = []
         init = np.zeros(self.states, dtype=np.float64)
@@ -101,16 +107,72 @@ class Ring:
                 r = self.R[a, state, new_state]
                 history.append([state, a, r, new_state])
                 temp_traj.append([i, j, state, a, r, new_state])
+                temp_df = pd.DataFrame([[state, a, new_state, r, j, i]], columns=column_names)
+                data = pd.concat([data, temp_df], ignore_index=True)
                 state = new_state
             trajectories.append(temp_traj)
         init /= np.sum(init)
         batch_traj = [val for sublist in trajectories for val in sublist]
+
+        if self.idd is None:
+            path = ""+self.envname+"/traj"
+        else:
+            path = "" + self.envname + "/"+self.idd+"/traj"
+
+        # Check whether the specified path exists or not
+        isExist = os.path.exists(path)
+
+        if not isExist:
+            # Create a new directory because it does not exist
+            os.makedirs(path)
+            print("The new directory is created!")
+        data.to_csv(path+"/traj_"+str(id1)+"_"+str(id2)+".csv", index=False)
         return history, init, trajectories, batch_traj
+
+    def to_rsolver(self):
+        if self.idd is None:
+            path = "" + self.envname
+        else:
+            path = "" + self.envname + "/" +self.idd
+
+        # Check whether the specified path exists or not
+        isExist = os.path.exists(path)
+
+        if not isExist:
+            # Create a new directory because it does not exist
+            os.makedirs(path)
+            print("The new directory is created!")
+
+        with open(path+"/parameters.csv", "w", encoding = 'utf-8') as f:
+            f.write("parameter,value\n")
+            f.write("discount,0.90\n")
+
+        with open(path+"/true.csv", "w", encoding = 'utf-8') as f:
+            f.write("idstatefrom,idaction,idstateto,probability,reward\n")
+            for s in range(self.T.shape[1]):
+                for sn in range(self.T.shape[2]):
+                    for a in range(self.T.shape[0]):
+                        f.write(""+str(s)+","+str(a)+","+str(sn)+","+str(self.T[a,s,sn])+","+str(self.R[a,s,sn])+"\n")
+
+        df = pd.read_csv(path+"/true.csv")
+        df.to_csv(path+"/true.csv.xz", index=False)
+        del df
+
+        with open(path+"/initial.csv", "w", encoding='utf-8') as f:
+            f.write("idstate,probability\n")
+            for s in range(self.init.shape[0]):
+                f.write(""+str(s)+","+str(self.init[s])+"\n")
+
+        df = pd.read_csv(path+"/initial.csv")
+        df.to_csv(path+"/initial.csv.xz", index=False)
+        del df
 
 
 # inherits method from Ring
 class Chain(Ring):
-    def __init__(self):
+    def __init__(self, idd=None):
+        self.idd = idd
+        self.envname = "chain"
         self.states = 5
         self.actions = 2
         self.R = np.zeros((self.actions, self.states, self.states))
@@ -129,8 +191,10 @@ class Chain(Ring):
 
 # inherits method from Ring
 class FrozenLake(Ring):
-    def __init__(self, type='random'):
-        self.env = gym.make('FrozenLake8x8-v1')
+    def __init__(self, type='random', idd=None):
+        self.idd = idd
+        self.envname = "flake64"
+        self.env = gym.make('FrozenLake8x8-v0')
         self.states = 64
         self.actions = 4
         description = self.env.P
@@ -158,3 +222,5 @@ class FrozenLake(Ring):
                 somma = np.sum(self.T[a, s])
                 if somma > 0:
                     self.T[a, s] /= somma
+
+

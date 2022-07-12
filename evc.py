@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 #
-# Copyright 2021 Giorgio Angelotti
+# Copyright 2022 Giorgio Angelotti
 #
 # This file is part of EvC.
 #
@@ -21,9 +21,12 @@
 import multiprocessing as mp
 import numpy as np
 import mdptoolbox
+import pandas as pd
+import subprocess
 from math import ceil
 from environments import Ring
-from model_utilities import dirichlet_sample, quantile_calc, learn_transition, oracle_mopo, oracle_morel
+from model_utilities import dirichlet_sample, quantile_calc, learn_transition, \
+    compute_returns, compute_ratio_det, compute_ratio_stoch, compute_F
 from solvers import policy_iteration, policy_eval_i, pol_model, policy_eval, policy_eval_i_s
 from finite_mdp import MDP, SPIBB, BOPAH, Alpha  # CODE TAKEN FROM: https://github.com/KAIST-AILab/BOPAH
 
@@ -62,12 +65,18 @@ def solve_lmdp(action_space, state_space, reward, gamma, init, N,
 
     res = []
     for policy in policies:
-        res.append(quantile_calc(np.array(policy, dtype=np.int32), dirichlet_sample, N+1, M, reward, gamma, init,
-                                 quantile, 5000, 0.01, confidence=confidence, max_size=50000))
+        if len(policy.shape) == 1:
+            res.append(quantile_calc(np.array(policy, dtype=np.int32), dirichlet_sample, N+1, M, reward, gamma, init,
+                                 quantile, 20000, 0.005, confidence=confidence, max_size=1000000, evaluator=policy_eval_i))
+        elif len(policy.shape) == 2:
+            res.append(quantile_calc(np.array(policy, dtype=np.int32), dirichlet_sample, N + 1, M, reward, gamma, init,
+                                  quantile, 20000, 0.005, confidence=confidence, max_size=1000000, evaluator=policy_eval_i_s))
+
     output = []  # expected value
     output2 = []  # VaR
     output3 = []  # CVaR
     output4 = []  # Optimistic
+
     for i in range(len(res)):
         output.append(res[i][0])
         output2.append(res[i][2])
@@ -112,7 +121,7 @@ def solve_lmdp(action_space, state_space, reward, gamma, init, N,
             for policy in new_pol:
                 res.append(
                     quantile_calc(np.array(policy, dtype=np.int32), dirichlet_sample, N + 1, M, reward, gamma, init,
-                                  quantile, 5000, 0.01, confidence=confidence, max_size=50000))
+                                  quantile, 20000, 0.005, confidence=confidence, max_size=1000000, evaluator=policy_eval_i))
             for i in range(z, len(res)):
                 output.append(res[i][0])
                 output2.append(res[i][2])
@@ -124,22 +133,7 @@ def solve_lmdp(action_space, state_space, reward, gamma, init, N,
     index3 = np.argmax(output3)
     index4 = np.argmax(output4)
 
-    return res[index][1], res[index2][1], res[index3][1], res[index4][1]
-
-
-# FUNCTION WHICH SOLVES AN MOREL FOR A GIVEN KAPPA AND THRESHOLD ALPHA WITH ORACLE GIVEN UNCERTAINTY
-# Inputs: kappa, alpha, true transition matrix T, most likely transition matrix M, immediate reward R,
-#          initial state distribution ins, optimal performance, starting policy of policy iteration
-# Output: performance of Morel
-def solve_morel(kappa, alpha, T, M, R, gamma, ins, V_opt, pol, env):
-    model_morel, reward_morel = oracle_morel(kappa, alpha, T, M, R)
-    init_morel = np.zeros(model_morel.shape[1])
-    init_morel[:-1] = ins
-    poly = np.zeros(model_morel.shape[1], dtype=np.int32)
-    poly[:-1] = pol
-    policy_morel = policy_iteration(model_morel, reward_morel, gamma, poly)[:-1]
-    output = policy_eval_i(T, R, policy_morel, gamma, ins) / V_opt
-    return output
+    return res[index][1], res[index2][1], res[index3][1], res[index4][1], res[index][0], res[index2][2], res[index3][3], res[index4][4]
 
 
 if __name__ == '__main__':
@@ -199,9 +193,10 @@ if __name__ == '__main__':
 
     elif config.environment == 'frozen64':
         from environments import FrozenLake
-        mdp = FrozenLake(type='random')
+        mdp = FrozenLake(type='random', idd=str(config.number))
         gamma = 0.90
 
+    mdp.to_rsolver()
     # Obtaining the optimal policy using MDP Toolbox and the matrix representation (eval_type=0)
     pi_optimal = mdptoolbox.mdp.PolicyIteration(mdp.T, mdp.R, gamma, eval_type=0, max_iter=1e7)
     pi_optimal.run()
@@ -213,6 +208,9 @@ if __name__ == '__main__':
 
     t, r = pol_model(mdp.T, mdp.R, optimal_policy)  # computing the Markov Chain Transition function t, exp. reward r
     V_opt = policy_eval_i(mdp.T, mdp.R, optimal_policy, gamma, mdp.init)  # computing the performance
+    #V_opt_quant = iterative_policy_eval_i_quantile(mdp.T, mdp.R, optimal_policy, gamma, mdp.init)
+    print(V_opt)
+    #print(V_opt_quant)
     Vmax = np.max(policy_eval(t, r, gamma))  # computing Vmax to insert in the Oracle MOPO
 
     # initializing arrays for the results
@@ -221,24 +219,39 @@ if __name__ == '__main__':
     qlmdp = np.zeros_like(trivial)
     clmdp = np.zeros_like(trivial)
     olmdp = np.zeros_like(trivial)
-    mopo = np.zeros((trivial.shape[0], trivial.shape[1], 5))
-    morel = np.zeros((trivial.shape[0], trivial.shape[1], 5))
+    ulmdp = np.zeros_like(trivial)
+    uclmdp = np.zeros_like(trivial)
+    counterlmdp = np.zeros_like(trivial)
+    counterqlmdp = np.zeros_like(trivial)
+    counterqunolmdp = np.zeros_like(trivial)
+    counterclmdp = np.zeros_like(trivial)
+    countercunolmdp = np.zeros_like(trivial)
+    counterolmdp = np.zeros_like(trivial)
     spibb0 = np.zeros((trivial.shape[0], trivial.shape[1], 7))
     bopah0 = np.zeros((trivial.shape[0], trivial.shape[1], 1, 1))
+    bcrg = np.zeros_like(trivial)
+    norbur = np.zeros_like(trivial)
+    norbusr = np.zeros_like(trivial)
+    norbuvr = np.zeros_like(trivial)
+    random_res = np.zeros_like(trivial)
 
     # baseline policy uniform random
     pi_b = np.ones((mdp.states, mdp.actions)) / mdp.actions
 
+    pol_dict = {}
     for traj_number in range(trivial.shape[0]):
+        pol_dict[str(traj_number)] = {}
         for trial in range(trivial.shape[1]):
             #print(str(traj_number)+'_'+str(trial), end='\n')
             # generate traj_number+tmin trajectories of config.steps each
-            hist, init, trajectories, batch_traj = mdp.generate_trajectories(traj_number + int(config.tmin), int(config.steps))
+            hist, init, trajectories, batch_traj = mdp.generate_trajectories(traj_number + int(config.tmin), int(config.steps), id1=traj_number, id2=trial)
             M, N = learn_transition(mdp.T, hist)  # M = most likely T, N = transition counter
+            returns = compute_returns(trajectories, gamma)
             trivial_policy = policy_iteration(M, mdp.R, gamma, optimal_policy)  # solving the most likely
             #print('Trivial policy = ' + str(trivial_policy))
             # performance of trivial_policy in the real model, normalized by the one of the optimal policy
             trivial[traj_number, trial] = policy_eval_i(mdp.T, mdp.R, trivial_policy, gamma, mdp.init) / V_opt
+            print(trivial[traj_number, trial])
 
             models = dirichlet_sample(N+1, int(config.sampled))  # sampling config.sampled models from the posterior
             temp = np.zeros((1, M.shape[0], M.shape[1], M.shape[2]))
@@ -257,8 +270,76 @@ if __name__ == '__main__':
             pool.close()
             pool.join()
 
+            # R scripts for norbu and bcr
+            if mdp.envname != "flake64":
+                subprocess.run(['Rscript', mdp.envname + ".R", str(traj_number), str(trial)])
+                subprocess.run(['Rscript', mdp.envname + "_ev.R", str(traj_number), str(trial)])
+                posterior = "" + mdp.envname + "/posteriors/" + str(traj_number) + "_" + str(trial) + "/"
+                traj_file = "" + mdp.envname + "/traj/traj_" + str(traj_number) + "_" + str(trial) + ".csv"
+
+            else:
+                subprocess.run(['Rscript', "flake64.R", str(config.number), str(traj_number), str(trial)])
+                subprocess.run(['Rscript', "flake64_ev.R", str(config.number), str(traj_number), str(trial)])
+                posterior = "flake64/" + str(config.number) + "/posteriors/" + str(traj_number) + "_" + str(
+                    trial) + "/"
+                traj_file = "flake64/traj/traj_" + str(traj_number) + "_" + str(trial) + ".csv"
+
+            policy_bcrg = pd.read_csv(posterior + "bcr_g_1_solution.csv")
+            policy_norbur = pd.read_csv(posterior + "norbu_r_1_solution.csv")
+            policy_norbusr = pd.read_csv(posterior + "norbu_sr_1_solution.csv")
+            policy_norbuvr = pd.read_csv(posterior + "norbuv_r_1_solution.csv")
+
+            # REMOVE TRAJECTORY AND POSTERIOR
+            subprocess.run(['rm', traj_file])
+            subprocess.run(['rm', '-r', posterior[:-1]])
+
+            policy_bcrg = policy_bcrg.reset_index()  # make sure indexes pair with number of rows
+            policy_bcrg_np = np.zeros_like(optimal_policy)
+            for index, row in policy_bcrg.iterrows():
+                policy_bcrg_np[int(row["idstate"])] = int(row["idaction"])
+
+            policy_bcrg = policy_bcrg.reset_index()  # make sure indexes pair with number of rows
+            policy_bcrg_np = np.zeros_like(optimal_policy)
+            for index, row in policy_bcrg.iterrows():
+                policy_bcrg_np[int(row["idstate"])] = int(row["idaction"])
+
+            policy_norbur = policy_norbur.reset_index()  # make sure indexes pair with number of rows
+            policy_norbur_np = np.zeros_like(optimal_policy)
+            for index, row in policy_norbur.iterrows():
+                policy_norbur_np[int(row["idstate"])] = int(row["idaction"])
+
+            policy_norbusr = policy_norbusr.reset_index()  # make sure indexes pair with number of rows
+            policy_norbusr_np = np.zeros_like(optimal_policy)
+            for index, row in policy_norbusr.iterrows():
+                policy_norbusr_np[int(row["idstate"])] = int(row["idaction"])
+
+            policy_norbuvr = policy_norbuvr.reset_index()  # make sure indexes pair with number of rows
+            policy_norbuvr_np = np.zeros_like(optimal_policy)
+            for index, row in policy_norbuvr.iterrows():
+                policy_norbuvr_np[int(row["idstate"])] = int(row["idaction"])
+
+            perf_bcrg = policy_eval_i(mdp.T, mdp.R, policy_bcrg_np, gamma, mdp.init) / V_opt
+
+            bcrg[traj_number, trial] = perf_bcrg
+
+            policies.append(policy_bcrg_np)
+
+            perf_norbur = policy_eval_i(mdp.T, mdp.R, policy_norbur_np, gamma, mdp.init) / V_opt
+            norbur[traj_number, trial] = perf_norbur
+            policies.append(policy_norbur_np)
+
+            perf_norbusr = policy_eval_i(mdp.T, mdp.R, policy_norbusr_np, gamma, mdp.init) / V_opt
+            norbusr[traj_number, trial] = perf_norbusr
+            policies.append(policy_norbusr_np)
+
+            perf_norbuvr = policy_eval_i(mdp.T, mdp.R, policy_norbuvr_np, gamma, mdp.init) / V_opt
+            norbuvr[traj_number, trial] = perf_norbuvr
+            policies.append(policy_norbuvr_np)
+
             policies.append(trivial_policy)
-            # convert the list of numpy vectors in list of tuples
+
+            pol_dict[str(traj_number)][str(trial)] = policies
+
             for idx in range(len(policies)):
                 policies[idx] = tuple(policies[idx])
             policies = list(set(policies))  # remove duplicates
@@ -266,58 +347,13 @@ if __name__ == '__main__':
             for idx in range(len(policies)):
                 policies[idx] = np.array(policies[idx], dtype=np.int32)
 
-            if len(policies) > 1 or int(config.full) == 1:  # if there is more than one policy in the list
-                # Solve the Bayesian MDP (Expected Value, VaR, CVaR, Optimistic)
-                if int(config.full) == 1:
-                    pol_best, pol_q_best, pol_c_best, pol_o_best = solve_lmdp(mdp.actions, mdp.states, mdp.R, gamma,
-                                                                              init, N, M, float(config.quantile),
-                                                                              float(config.confidence),
-                                                                              str(config.environment), policies=None)
-
-                else:
-                    pol_best, pol_q_best, pol_c_best, pol_o_best = solve_lmdp(mdp.actions, mdp.states, mdp.R, gamma,
-                                                                              init, N, M, float(config.quantile),
-                                                                              float(config.confidence),
-                                                                              str(config.environment),
-                                                                              policies=policies)
-                lmdp[traj_number, trial] = policy_eval_i(mdp.T, mdp.R, pol_best, gamma, mdp.init) / V_opt
-                qlmdp[traj_number, trial] = policy_eval_i(mdp.T, mdp.R, pol_q_best, gamma, mdp.init) / V_opt
-                clmdp[traj_number, trial] = policy_eval_i(mdp.T, mdp.R, pol_c_best, gamma, mdp.init) / V_opt
-                olmdp[traj_number, trial] = policy_eval_i(mdp.T, mdp.R, pol_o_best, gamma, mdp.init) / V_opt
-            else:  # the only policy is the one of the most likely model, the performance is the same
-                lmdp[traj_number, trial] = trivial[traj_number, trial]
-                qlmdp[traj_number, trial] = trivial[traj_number, trial]
-                clmdp[traj_number, trial] = trivial[traj_number, trial]
-                olmdp[traj_number, trial] = trivial[traj_number, trial]
-
-            reward_mopo = oracle_mopo(mdp.T, M, mdp.R, Vmax, gamma)  # compute the penalized reward of MOPO using the
-            # oracle
-            # Solve MOPO with running gamma
-            inputs = [(mdp.T, reward_mopo, 0.2*i, trivial_policy) for i in range(1, 5)]
-            inputs.append((mdp.T, reward_mopo, gamma, trivial_policy))
-            pool = mp.Pool(mp.cpu_count())
-            res_mopo = pool.starmap(policy_iteration, inputs)
-            pool.close()
-            pool.join()
-            inputs = [(mdp.T, mdp.R, res_mopo[i], gamma, mdp.init) for i in range(len(res_mopo))]
-            pool = mp.Pool(mp.cpu_count())
-            res_mopo = pool.starmap(policy_eval_i, inputs)
-            pool.close()
-            pool.join()
-            for i in range(len(res_mopo)):
-                mopo[traj_number, trial, i] = res_mopo[i] / V_opt
-
-            # Solving MOREL with kappa = 100, and running alpha from 0.1 to 0.5
-            alpha_morel = [0.1 for i in range(1, morel.shape[2]+1)]
-            inputs = [(100, alpha_morel[i], mdp.T, M, mdp.R, gamma, mdp.init, V_opt, trivial_policy,
-                       str(config.environment)) for i in range(len(alpha_morel))]
-            pool = mp.Pool(mp.cpu_count())
-            res_morel = pool.starmap(solve_morel, inputs)
-            pool.close()
-            pool.join()
-
-            for i in range(len(res_morel)):
-                morel[traj_number, trial, i] = res_morel[i]
+            quantiles = []
+            cvars = []
+            for policy in policies:
+                ratios = compute_ratio_det(trajectories, policy)
+                _, _, _, tquant, tcvar = compute_F(returns, ratios, float(config.quantile))
+                quantiles.append(tquant)
+                cvars.append(tcvar)
 
             # SOLVING SPIBB with different N thresholds
             Mspibb = np.zeros((mdp.T.shape[1], mdp.T.shape[0], mdp.T.shape[2]))
@@ -334,12 +370,25 @@ if __name__ == '__main__':
             mdpspibb = MDP(S=mdp.states, A=mdp.actions, T=Mspibb, R=Rspibb, gamma=gamma, temperature=0)
 
             spibbcount = 0
-            for N_threshold in [1, 2, 3, 5, 7, 10, 20]:
+            #for N_threshold in [1, 2, 3, 5, 7, 10, 20]:
+            for N_threshold in [1]:
                 pi_spibb = SPIBB(mdpspibb, pi_b, Nspibb, N_threshold=N_threshold)
+
+                ### UNO
+                ratios = compute_ratio_stoch(trajectories, pi_spibb)
+                _, _, _, tquant, tcvar = compute_F(returns, ratios, float(config.quantile))
+                quantiles.append(tquant)
+                cvars.append(tcvar)
+
                 V_spibb = policy_eval_i_s(mdp.T, mdp.R, pi_spibb, gamma, mdp.init) / V_opt
                 #print(N_threshold, V_spibb)
                 spibb0[traj_number, trial, spibbcount] = V_spibb
                 spibbcount += 1
+
+                # add to EvC
+                #pi_spibb_evc = np.argmax(pi_spibb, axis=1)
+                #policies.append(pi_spibb)
+                pol_dict[str(traj_number)][str(trial)].append(pi_spibb)
 
             # BOPAH
             fcount = 0
@@ -350,14 +399,124 @@ if __name__ == '__main__':
                                   psi=np.clip(np.ones(dof) * 1.0 / len(trajectories), 0.0001, np.inf))
                     pi_bopah, _ = BOPAH(mdp.states, mdp.actions, Rspibb, gamma, 0, trajectories, pi_b,
                                         alpha, N_folds=fold)
+
+                    ### pi_bopah
+                    ratios = compute_ratio_stoch(trajectories, pi_bopah)
+                    _, _, _, tquant, tcvar = compute_F(returns, ratios, float(config.quantile))
+                    quantiles.append(tquant)
+                    cvars.append(tcvar)
+
                     perf_bopah = policy_eval_i_s(mdp.T, mdp.R, pi_bopah, gamma, mdp.init) / V_opt
+
+                    # add to EvC
+                    #pi_bopah_evc = np.argmax(pi_bopah, axis=1)
+                    #policies.append(pi_bopah)
+                    pol_dict[str(traj_number)][str(trial)].append(pi_bopah)
                     #print('Bopah')
                     #print(fold, dof, perf_bopah)
                     bopah0[traj_number, trial, fcount, dcount] = perf_bopah
                     dcount += 1
                 fcount += 1
 
+            ## EVALUATE RANDOM POLICY
+            perf_rand = policy_eval_i_s(mdp.T, mdp.R, pi_b, gamma, mdp.init) / V_opt
+            random_res[traj_number, trial] = perf_rand
+
+            ## Take UNO best policy:
+            uno_var_idx = np.argmax(quantiles)
+            uno_cvar_idx = np.argmax(cvars)
+            if uno_var_idx == len(quantiles)-2:
+                uno_var_pol = pi_spibb
+            elif uno_var_idx == len(quantiles)-1:
+                uno_var_pol = pi_bopah
+            else:
+                uno_var_pol = policies[uno_var_idx]
+
+            if uno_cvar_idx == len(quantiles)-2:
+                uno_cvar_pol = pi_spibb
+            elif uno_cvar_idx == len(quantiles)-1:
+                uno_cvar_pol = pi_bopah
+            else:
+                uno_cvar_pol = policies[uno_cvar_idx]
+
+            if len(policies) > 1 or int(config.full) == 1:  # if there is more than one policy in the list
+                # Solve the Bayesian MDP (Expected Value, VaR, CVaR, Optimistic)
+                if int(config.full) == 1:
+                    pol_best, pol_q_best, pol_c_best, pol_o_best, mbest, vbest, cvbest, opbest = solve_lmdp(mdp.actions, mdp.states, mdp.R, gamma,
+                                                                              init, N, M, float(config.quantile),
+                                                                              float(config.confidence),
+                                                                              str(config.environment), policies=None)
+
+                else:
+                    pol_best, pol_q_best, pol_c_best, pol_o_best, mbest, vbest, cvbest, opbest = solve_lmdp(mdp.actions, mdp.states, mdp.R, gamma,
+                                                                              init, N, M, float(config.quantile),
+                                                                              float(config.confidence),
+                                                                              str(config.environment),
+                                                                              policies=policies)
+                pol_dict[str(traj_number)][str(trial)].append(pol_best)
+                pol_dict[str(traj_number)][str(trial)].append(pol_q_best)
+                pol_dict[str(traj_number)][str(trial)].append(pol_c_best)
+                pol_dict[str(traj_number)][str(trial)].append(pol_o_best)
+                lmdp[traj_number, trial] = policy_eval_i(mdp.T, mdp.R, pol_best, gamma, mdp.init)
+                qlmdp[traj_number, trial] = policy_eval_i(mdp.T, mdp.R, pol_q_best, gamma, mdp.init)
+                clmdp[traj_number, trial] = policy_eval_i(mdp.T, mdp.R, pol_c_best, gamma, mdp.init)
+                olmdp[traj_number, trial] = policy_eval_i(mdp.T, mdp.R, pol_o_best, gamma, mdp.init)
+                if len(uno_var_pol.shape) == 1:
+                    ulmdp[traj_number, trial] = policy_eval_i(mdp.T, mdp.R, uno_var_pol, gamma, mdp.init)
+                    if np.array_equal(uno_var_pol, pol_q_best) is True:
+                        counterqunolmdp[traj_number,trial] = 1
+                else:
+                    ulmdp[traj_number, trial] = policy_eval_i_s(mdp.T, mdp.R, uno_var_pol, gamma, mdp.init)
+
+                if len(uno_cvar_pol.shape) == 1:
+                    uclmdp[traj_number, trial] = policy_eval_i(mdp.T, mdp.R, uno_cvar_pol, gamma, mdp.init)
+                    if np.array_equal(uno_cvar_pol, pol_c_best) is True:
+                        countercunolmdp[traj_number, trial] = 1
+                else:
+                    uclmdp[traj_number, trial] = policy_eval_i_s(mdp.T, mdp.R, uno_cvar_pol, gamma, mdp.init)
+
+                if lmdp[traj_number, trial] >= mbest or abs(lmdp[traj_number, trial] - mbest) < 1e-7:
+                    counterlmdp[traj_number, trial] = 1
+                if qlmdp[traj_number, trial] >= vbest or abs(qlmdp[traj_number, trial] - vbest) < 1e-7:
+                    counterqlmdp[traj_number, trial] = 1
+                if clmdp[traj_number, trial] >= cvbest or abs(clmdp[traj_number, trial] - cvbest) < 1e-7:
+                    counterclmdp[traj_number, trial] = 1
+                if olmdp[traj_number, trial] >= opbest or abs(olmdp[traj_number, trial] - opbest) < 1e-7:
+                    counterolmdp[traj_number, trial] = 1
+
+                lmdp[traj_number, trial] /= V_opt
+                qlmdp[traj_number, trial] /= V_opt
+                clmdp[traj_number, trial] /= V_opt
+                olmdp[traj_number, trial] /= V_opt
+                ulmdp[traj_number, trial] /= V_opt
+                uclmdp[traj_number, trial] /= V_opt
+
+            else:  # the only policy is the one of the most likely model, the performance is the same
+                lmdp[traj_number, trial] = trivial[traj_number, trial]
+                qlmdp[traj_number, trial] = trivial[traj_number, trial]
+                clmdp[traj_number, trial] = trivial[traj_number, trial]
+                olmdp[traj_number, trial] = trivial[traj_number, trial]
+                ulmdp[traj_number, trial] = trivial[traj_number, trial]
+                uclmdp[traj_number, trial] = trivial[traj_number, trial]
+
+                counterlmdp[traj_number, trial] = 1
+                counterqlmdp[traj_number, trial] = 1
+                counterclmdp[traj_number, trial] = 1
+                counterolmdp[traj_number, trial] = 1
+                counterqunolmdp[traj_number, trial] = 1
+                countercunolmdp[traj_number, trial] = 1
+
+            #
             np.savez_compressed(str(config.environment)+'_temp_'+str(config.number)+'.npz', t=trivial, l=lmdp, q=qlmdp,
-                                m=mopo, c=clmdp, o=olmdp, r=morel, s=spibb0, b=bopah0, allow_pickle=True)
-    np.savez_compressed(str(config.environment)+'_final_'+str(config.number)+'.npz', t=trivial, l=lmdp, q=qlmdp, m=mopo,
-                        c=clmdp, o=olmdp, r=morel, s=spibb0, b=bopah0,  allow_pickle=True)
+                        m=pol_dict, c=clmdp, o=olmdp, s=spibb0, b=bopah0, g=bcrg, f=norbur, sr=norbusr, vr=norbuvr,
+                        z=random_res, uq=ulmdp, uc=uclmdp, coulmdp=counterlmdp, couqlmdp=counterqlmdp, couclmdp=counterclmdp,
+                        couolmdp=counterolmdp, countercunolmdp=countercunolmdp, counterqunolmdp=counterqunolmdp,
+                        allow_pickle=True)
+
+    np.savez_compressed(str(config.environment) + '_final_' + str(config.number) + '.npz', t=trivial, l=lmdp, q=qlmdp,
+                        m=pol_dict, c=clmdp, o=olmdp, s=spibb0, b=bopah0, g=bcrg, f=norbur, sr=norbusr, vr=norbuvr,
+                        z=random_res, uq=ulmdp, uc=uclmdp, coulmdp=counterlmdp, couqlmdp=counterqlmdp, couclmdp=counterclmdp,
+                        couolmdp=counterolmdp, countercunolmdp=countercunolmdp, counterqunolmdp=counterqunolmdp,
+                        allow_pickle=True)
+    # DELETING FOLDER FOR SPACE
+    subprocess.run(['rm', '-r', mdp.envname+"/" + str(config.number)])

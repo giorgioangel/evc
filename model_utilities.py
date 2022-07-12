@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 #
-# Copyright 2021 Giorgio Angelotti
+# Copyright 2022 Giorgio Angelotti
 #
 # This file is part of EvC.
 #
@@ -20,7 +20,7 @@
 
 import numpy as np
 import multiprocessing as mp
-from math import floor
+from math import sqrt
 from scipy.stats import binom
 from solvers import policy_eval_i
 
@@ -61,6 +61,7 @@ def binom_sum(r, s, n, p):
 # Output: (Expected value, policy, VaR-quantile, CVaR-quantile, Optimistic-quantile)
 def quantile_calc(policy, sampler, alpha, M, R, gamma, init, quantile, batch_size, rel_tol, evaluator=policy_eval_i,
                   confidence=0.01, max_size=4000):
+    #vrange = 1./(1.-gamma)*(np.max(R)-np.min(R))
     M = M.reshape((1, M.shape[0], M.shape[1], M.shape[1]))
     sample = sampler(alpha, batch_size)
     sample = np.vstack((sample, M))
@@ -75,6 +76,8 @@ def quantile_calc(policy, sampler, alpha, M, R, gamma, init, quantile, batch_siz
     del result, res
     done = False
     f_sample.sort()
+    #eps = rel_tol * (f_sample[-1] - f_sample[0])
+    #eps_abs = rel_tol * vrange
     while not done and len(f_sample) < max_size:
         n = len(f_sample)
         print(policy, n, end='         \r')
@@ -88,6 +91,7 @@ def quantile_calc(policy, sampler, alpha, M, R, gamma, init, quantile, batch_siz
         while (r != 0 or s != n-1) and not done:
             n = len(f_sample)
             if prob > 1-confidence and f_sample[s]-f_sample[r] < rel_tol*(f_sample[-1]-f_sample[0]):
+            #if prob > 1 - confidence and f_sample[s] - f_sample[r] < rel_tol * vrange:
                 done = True
             else:
                 c = (c+1) % 2
@@ -113,8 +117,10 @@ def quantile_calc(policy, sampler, alpha, M, R, gamma, init, quantile, batch_siz
             f_sample.append(value)
         del result, res
         f_sample.sort()
-    output = [np.mean(f_sample), policy, f_sample[floor(len(f_sample)*quantile)],
-              np.mean(f_sample[:floor(len(f_sample)*quantile)]), np.mean(f_sample[floor(len(f_sample)*quantile):])]
+        #eps = rel_tol * (f_sample[-1] - f_sample[0])
+        #eps = rel_tol * vrange
+    output = [np.mean(f_sample), policy, f_sample[r],
+              np.mean(f_sample[:r+1])-np.std(f_sample[:r+1], ddof=1)/sqrt(r), np.mean(f_sample[r+1:])]
     return output
 
 
@@ -200,5 +206,83 @@ def oracle_morel(kappa, alpha, T, M, R):
 # FUNCTION THAT CHECKS IF A MATRIX IS INVERTIBLE
 def is_invertible(a):
     return a.shape[0] == a.shape[1] and np.linalg.matrix_rank(a) == a.shape[0]
+
+
+def compute_returns(trajectories, gamma):
+    returns = []
+    for i in range(len(trajectories)):
+        temp_sum = 0
+        for t in range(len(trajectories[i])):
+            temp_sum += trajectories[i][t][4]*gamma**t
+        returns.append(temp_sum)
+    return returns
+
+
+## assuming behav. policy is uniform
+def compute_ratio_det(trajectories, policy):
+    ratios = []
+    for i in range(len(trajectories)):
+        temp_prod = policy.shape[0]**len(trajectories[i])
+        for t in range(len(trajectories[i])):
+            if policy[int(trajectories[i][t][2])] != int(trajectories[i][t][3]):
+                temp_prod = 0.
+                break
+        ratios.append(temp_prod)
+    return ratios
+
+
+## assuming behav. policy is uniform
+def compute_ratio_stoch(trajectories, policy):
+    ratios = []
+    for i in range(len(trajectories)):
+        temp_prod = policy.shape[0]**len(trajectories[i])
+        for t in range(len(trajectories[i])):
+            temp_prod *= policy[int(trajectories[i][t][2]),int(trajectories[i][t][3])]
+        ratios.append(temp_prod)
+    return ratios
+
+
+def compute_F(returns, ratios, q):
+    zipped_lists = zip(returns, ratios)
+    sorted_pairs = sorted(zipped_lists)
+
+    tuples = zip(*sorted_pairs)
+    sorted_returns, sorted_ratios = [list(tuple) for tuple in tuples]
+
+    unique_values = list(set(sorted_returns))
+    unique_values.sort()
+    F = []
+
+    counter = 0
+    for i in range(len(unique_values)):
+        temp_value = 0
+        for j in range(counter, len(sorted_returns)):
+            if sorted_returns[j] <= unique_values[i]:
+                temp_value += ratios[j]
+            else:
+                counter = j
+                break
+        if counter != 0:
+            F.append(temp_value/counter)
+        else:
+            F.append(temp_value)
+
+    qval = None
+    for i in range(len(F)):
+        if F[i] >= q:
+            qval = unique_values[i]
+            break
+    if qval is None:
+        qval = unique_values[-1]
+
+    dF = np.diff(F, prepend=[0])
+
+    cvar = 0
+    for i in range(len(unique_values)):
+        if unique_values[i] <= qval:
+            cvar += dF[i]*unique_values[i]
+    cvar /= q
+
+    return unique_values, F, dF, qval, cvar
 
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 #
-# Copyright 2021 Giorgio Angelotti
+# Copyright 2021 Anonymous Author - AAAI 2022 Submission
 #
 # This file is part of EvC.
 #
@@ -22,10 +22,10 @@ import numpy as np
 import numba as nb
 
 
-# FUNCTION THAT SOLVES AN UPPER TRIANGULAR LINEAR PROBLEM A x = b
+# FUNCTION THAT SOLVES AN UPPER TRIANGULAR LINEAR SYSTEM A x = b
 # Input: matrix A, known vector b
 # Output: Solution x
-@nb.njit((nb.float64[:, :], nb.float64[:]), fastmath=True, nogil=True, cache=True)
+@nb.njit((nb.float64[:, :], nb.float64[:]), fastmath=False, nogil=True, cache=True)
 def solve_triangular(matrix, vector):
     output = np.zeros_like(vector)
     output[-1] = vector[-1]/matrix[-1, -1]
@@ -39,7 +39,7 @@ def solve_triangular(matrix, vector):
 # IMMEDIATE REWARD.
 # Input: MDP transition matrix, Immediate Reward matrix, Policy
 # Output: MC transition matrix, Expected Reward matrix
-@nb.njit((nb.float64[:, :, :], nb.float64[:, :, :], nb.int32[:]), fastmath=True, nogil=True, cache=True)
+@nb.njit((nb.float64[:, :, :], nb.float64[:, :, :], nb.int32[:]), fastmath=False, nogil=True, cache=True)
 def pol_model(transition, reward, policy):
     rew = np.zeros(reward.shape[1], dtype=np.float64)
     trans = np.eye(reward.shape[1], dtype=np.float64)
@@ -49,6 +49,17 @@ def pol_model(transition, reward, policy):
         rew[s] = np.dot(trans[s], reward[index, s])
     return trans, rew
 
+
+# QUANTILE TEST
+@nb.njit((nb.float64[:, :, :], nb.float64[:, :, :], nb.int32[:]), fastmath=False, nogil=True, cache=True)
+def pol_model_quant(transition, reward, policy):
+    rew = np.zeros((reward.shape[1], reward.shape[2]), dtype=np.float64)
+    trans = np.eye(reward.shape[1], dtype=np.float64)
+    for s in range(reward.shape[1]):
+        index = policy[s]
+        trans[s] = transition[index, s]
+        rew[s] = np.multiply(trans[s], reward[index, s])
+    return trans, rew
 
 # FUNCTION THAT COMPUTES THE MARKOV CHAIN TRANSITION FUNCTION GIVEN A STOCHASTIC POLICY AND THE EXPECTED REWARD FROM THE
 # IMMEDIATE REWARD.
@@ -71,7 +82,7 @@ def pol_model_s(transition, reward, policy):
 # THE DOT PRODUCT BETWEEN THE VALUE FUNCTION AND THE INITIAL STATE DISTRIBUTION
 # Input: MDP transition matrix, Immediate Reward matrix, Policy, Gamma, Initial State distribution
 # Output: Performance of the policy
-@nb.njit((nb.float64[:, :, :], nb.float64[:, :, :], nb.int32[:], nb.float64, nb.float64[:]), fastmath=True, nogil=True,
+@nb.njit((nb.float64[:, :, :], nb.float64[:, :, :], nb.int32[:], nb.float64, nb.float64[:]), fastmath=False, nogil=True,
          cache=True)
 def policy_eval_i(t, r, policy, gamma, init):
     tre, re = pol_model(t, r, policy)
@@ -83,7 +94,6 @@ def policy_eval_i(t, r, policy, gamma, init):
     #v = np.dot(z, re)
     out = np.dot(init, v)
     return out
-
 
 # FUNCTION THAT PERFORMS POLICY EVALUATION FOR A STOCH. POLICY AND THEN OUTPUTS THE PERFORMANCE OF THE POLICY:
 # THE DOT PRODUCT BETWEEN THE VALUE FUNCTION AND THE INITIAL STATE DISTRIBUTION
@@ -104,7 +114,7 @@ def policy_eval_i_s(t, r, policy, gamma, init):
 # FUNCTION THAT PERFORMS POLICY EVALUATION AND THEN OUTPUTS THE VALUE FUNCTION
 # Input: MDP transition matrix, Immediate Reward matrix, Policy, Gamma
 # Output: Value function
-@nb.njit(fastmath=True, nogil=True, cache=True)
+@nb.njit(fastmath=False, nogil=True, cache=True)
 def policy_eval(t, r, gamma):
     z = np.eye(t.shape[0], dtype=np.float64) - gamma * t
     q, rr = np.linalg.qr(z)
@@ -118,7 +128,7 @@ def policy_eval(t, r, gamma):
 # FUNCTION THAT PERFORMS POLICY ITERATION AND THEN OUTPUTS THE OPTIMAL POLICY
 # Input: MDP transition matrix, Immediate Reward matrix, Gamma, Starting Policy
 # Output: Optimal Policy
-@nb.njit((nb.float64[:, :, :], nb.float64[:, :, :], nb.float64, nb.int32[:]), fastmath=True, nogil=True, cache=True)
+@nb.njit((nb.float64[:, :, :], nb.float64[:, :, :], nb.float64, nb.int32[:]), fastmath=False, nogil=True, cache=True)
 def policy_iteration(t, r, gamma, pol):
     policy = np.copy(pol)
     ptest = np.copy(policy)
@@ -156,10 +166,10 @@ def policy_iteration(t, r, gamma, pol):
 # THE DOT PRODUCT BETWEEN THE VALUE FUNCTION AND THE INITIAL STATE DISTRIBUTION
 # Input: MDP transition matrix, Immediate Reward matrix, Policy, Gamma, Initial State distribution
 # Output: Performance of the policy
-@nb.njit((nb.float64[:, :, :], nb.float64[:, :, :], nb.int32[:], nb.float64, nb.float64[:]), fastmath=True, nogil=True,
+@nb.njit((nb.float64[:, :, :], nb.float64[:, :, :], nb.int32[:], nb.float64, nb.float64[:]), fastmath=False, nogil=True,
          cache=True)
 def iterative_policy_eval_i(t, r, policy, gamma, init):
-    threshold = 0.01
+    threshold = 1e-7
     out = np.ones(t.shape[1], dtype=nb.float64)
     tre, re = pol_model(t, r, policy)
     delta = np.inf
@@ -174,8 +184,40 @@ def iterative_policy_eval_i(t, r, policy, gamma, init):
     out = np.dot(init, out)
     return out
 
+# FUNCTION THAT PERFORMS POLICY EVALUATION AND THEN OUTPUTS THE PERFORMANCE OF THE POLICY:
+# THE DOT PRODUCT BETWEEN THE VALUE FUNCTION AND THE INITIAL STATE DISTRIBUTION
+# Input: MDP transition matrix, Immediate Reward matrix, Policy, Gamma, Initial State distribution
+# Output: Performance of the policy
+#@nb.njit((nb.float64[:, :, :], nb.float64[:, :, :], nb.int32[:], nb.float64, nb.float64[:]), fastmath=False, nogil=True,
+#         cache=True)
+def iterative_policy_eval_i_quantile(t, r, policy, gamma, init):
+    threshold = 1e-7
+    q = 0.25
+    vout = np.zeros((t.shape[1], t.shape[1]), dtype=np.float64)
+    out = np.zeros(t.shape[1], dtype=np.float64)
+    ix = np.zeros(t.shape[1], dtype=np.int32)
+    tre, re = pol_model_quant(t, r, policy)
+    delta = np.inf
+    counter = 0
+    while delta >= threshold and counter < 1e7:
+        delta = 0
+        for s in range(tre.shape[1]):
+            counter += 1
+            v_temp = np.copy(vout)
+            vout[s] = re[s] + gamma*np.multiply(tre[s], vout[s])
+            indices = np.argsort(vout[s])
+            test = np.cumsum(tre[s, indices]) - q
+            for i in range(len(test)):
+                if test[i] >= 0:
+                    ix[s] = i
+                    break
+            delta = max(delta, np.max(np.abs(v_temp-vout)))
+    for s in range(tre.shape[1]):
+        out[s] = vout[s, ix[s]]
+    out = np.dot(init, out)
+    return out
 
-@nb.njit((nb.float64[:, :], nb.float64[:], nb.float64[:], nb.float64, nb.float64), fastmath=True, nogil=True,
+@nb.njit((nb.float64[:, :], nb.float64[:], nb.float64[:], nb.float64, nb.float64), fastmath=False, nogil=True,
          cache=True)
 def iterative_policy_eval(t, r, v, gamma, threshold):
     out = np.copy(v)
@@ -194,7 +236,7 @@ def iterative_policy_eval(t, r, v, gamma, threshold):
 # FUNCTION THAT PERFORMS POLICY ITERATION AND THEN OUTPUTS THE OPTIMAL POLICY
 # Input: MDP transition matrix, Immediate Reward matrix, Gamma, Starting Policy
 # Output: Optimal Policy
-@nb.njit((nb.float64[:, :, :], nb.float64[:, :, :], nb.float64, nb.int32[:]), fastmath=True, nogil=True, cache=True)
+@nb.njit((nb.float64[:, :, :], nb.float64[:, :, :], nb.float64, nb.int32[:]), fastmath=False, nogil=True, cache=True)
 def iterative_policy_iteration(t, r, gamma, pol):
     policy = np.copy(pol)
     ptest = np.copy(policy)

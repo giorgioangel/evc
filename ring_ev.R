@@ -1,0 +1,324 @@
+#!/usr/bin/Rscript
+
+# This script can be used to automate the evaluation and reporting of
+# the performance of various Bayesian robust and soft-robust algorithms.
+#
+# The script is flexible and works with pre-built domains
+#
+# Use the command browser() for debugging the methods (in their source)
+
+suppressPackageStartupMessages({
+    library(rcraam)
+    library(dplyr)
+    library(readr)
+    library(progress) })
+
+
+# more space for the huxtable output
+options(width = 100)
+# for interactive bug reduction
+rm(list = ls())
+
+## ------ Output file ---------
+domain_name <- "ring"
+# where to save the final result
+output_file <- "eval_results.csv"
+
+# whether to print partial results during the computation
+print_partial <- FALSE
+
+## ----- Parameters --------
+args <- commandArgs(trailingOnly=TRUE)
+traj_number <- as.integer(args[1])
+trial <- as.integer(args[2])
+#quantile <- as.float(args[3])
+#conf <- as.float(args[4])
+# weight on the risk measure used for evaluation
+risk_weight_eval <- 0.5
+
+# the algorithms can read and use these parameters
+params <- new.env()
+with(params, {
+    confidence <- 0.01      # value at risk confidence (1.0 is the worst case)
+    time_limit <- 10000    # time limit on computing the solution
+    cat("Using confidence =", confidence, ", risk_weight =", risk_weight_eval, "\n")
+})
+
+
+## ------ Define domains ------
+
+p <- paste("ring/posteriors/", as.character(traj_number), "_", as.character(trial), sep="")
+## ----- Define algorithms --------
+
+# list of algorithms, each one implemented in a separate
+# input file with a function:
+# result = algorithm_main(mdpo, initial, discount), where the result is a list:
+#        result$policy = computed policy
+#        result$estimate = estimated return (whatever metric is optimized)
+# and the parameters are:
+#        mdpo: dataframe with idstatefrom, idaction, idstateto, idoutcome, probability, reward
+#        initial: initial distribution, dataframe with idstate, probability (sums to 1)
+#        discount: discount rate [0,1]
+#
+# It is a good practice for each algorithm to the risk parameters
+# it is using. They may be reading the parameters from
+# the global environment. That is convenient but fragile
+algorithms_path <- "algorithms"
+
+algorithms <- list(
+    nominal = "nominal.R",
+    bcr_l = "bcr_local.R",
+    bcr_g = "bcr_global.R",
+    norbu_r = "norbu_r.R",
+    norbu_sr = "norbu_sr.R",
+    norbuv_r = "norbuv_r.R"
+)
+
+# Determines which parameter are used to optimize the risk for all algorithms
+risk_weights_optimize <- c(0.75)
+
+# construct paths to algorithms
+algorithms_paths <- lapply(algorithms, function(a){file.path(algorithms_path, a)} )
+
+## ---- Helper Methods: Evaluation -----------
+
+#' Evaluate a policy with respect to the true model
+#'
+#' @param mdp True MDP with outcomes
+#' @param policy Deterministic or randomized policy to be evaluated
+#' @param initial Initial distribution (dataframe)
+#' @param discount Discount factor
+compute_true_return <- function(mdp_true, policy, initial, discount){
+    if("probability" %in% names(policy)){
+        sol <- solve_mdp_rand(mdp_true, discount, policy_fixed = policy, show_progress = FALSE)
+    }
+    else{
+        sol <- solve_mdp(mdp_true, discount, policy_fixed = policy, show_progress = FALSE)
+    }
+    ret <- full_join(sol$valuefunction, initial, by = "idstate" ) %>%
+                 mutate(pv = probability * value) %>% na.fail()
+    sum(ret$pv)
+}
+
+#' Compute statistics for a computed (robust) policy
+#' @param name Name of the algorithm that produced the results
+#' @param mdp.bayesian MDP with outcomes representing Bayesian samples
+#' @param solution Output from the algorithm (policy and predicted)
+compute_statistics <- function(mdpo, mdp_true, solution, initial, discount){
+    # make sure that the policy is randomized (if no probabilities, just add the column)
+    policy <- solution$policy
+    if (!("probability" %in% names(policy)))
+        policy$probability <- 1.0
+
+    # terminal states should have no actions, so remove any actions that are
+    # negative
+    policy <- filter(policy, idaction >= 0)
+
+    # Check to make sure that no non-terminal states have a policy
+    #       with a negative idaction. Such actions will be optimized, which is
+    #       clearly undesirable.
+    nonterminal_randomized <-
+        policy %>%
+        filter(idaction < 0) %>%
+        inner_join(mdpo, by = c(idstate = 'idstatefrom'))
+    if (nrow(nonterminal_randomized) > 0) {
+        stop("Bug: Policy is to take action -1 in a non-terminal state.")
+        #print(nonterminal_randomized)
+    }
+
+    # compute the returns
+    bayes_returns <- revaluate_mdpo_rnd(mdpo, discount, policy, initial, TRUE)$return
+
+    # assume a uniform distribution over the outcomes
+    bayes_dst <- rep(1/length(bayes_returns), length(bayes_returns))
+    true_return <- compute_true_return(mdp_true, solution$policy, initial, discount)
+
+    # compute cvar and other metrics
+    cvar_val <- avar(bayes_returns, bayes_dst, 1 - params$confidence)$value
+    mean_val <- mean(bayes_returns)
+    list(
+        obj = solution$estimate,
+        true = true_return,
+        var = unname(quantile(bayes_returns, 1 - params$confidence)),
+        cvar = cvar_val,
+        mean = mean_val,
+        soft = (1 - risk_weight_eval) * mean_val +
+            risk_weight_eval * cvar_val
+    )
+}
+
+#' Constructs an empty statistics entry (used when the solution is not computed)
+empty_statistics <- function(){
+    list(
+        obj = NA,
+        true = NA,
+        var = NA,
+        cvar = NA,
+        mean = NA,
+        soft = NA
+    )
+}
+
+## ---- Helper Methods:    -------
+
+#' Loads problem domain information
+#'
+#' @param dir_path Path to the directory with the required files
+load_domain <- function(dir_path){
+    cat("        Loading parameters ... \n")
+    parameters <- read_csv(file.path(dir_path, "parameters.csv"), col_types = cols())
+
+    cat("        Loading true MDP ... ")
+    true_mdp <- read_csv(file.path(dir_path, "true.csv.xz"), col_types =
+                                             cols(idstatefrom = "i", idaction = "i", idstateto = "i",
+                                                        probability = "d", reward = "d"))
+    sa.count <- select(true_mdp, idstatefrom, idaction) %>% unique() %>% nrow()
+    cat(sa.count, "state-actions \n")
+
+    cat("        Loading initial distribution ... ")
+    initial <- read_csv(file.path(dir_path, "initial.csv.xz"), col_types =
+                                            cols(idstate= "i", probability = "d"))
+    s.count <- select(initial, idstate) %>% unique() %>% nrow()
+    cat(s.count, "states \n")
+
+    # TRAINING
+    # unzip and save the raw csv file to speed up loading of the file
+    cat("        Loading training file ... ")
+    training_file <- file.path(dir_path, "training.csv.xz")
+    stopifnot(file.exists(training_file))
+    if(file.size(training_file) < 10e6){
+        training <- read_csv(training_file, col_types =
+                                                 cols(idstatefrom = "i", idaction = "i", idstateto = "i",
+                                                            idoutcome = "i", probability = "d", reward = "d"))
+    } else {
+        training_raw <- tools::file_path_sans_ext(training_file)
+        if(!file.exists(training_raw)) {
+            cat("            Large, decompressing using pixz ... \n")
+            system2("pixz", paste("-d -k", training_file))
+        }
+        training <- read_csv(training_raw, col_types =
+                                                 cols(idstatefrom = "i", idaction = "i", idstateto = "i",
+                                                            idoutcome = "i", probability = "d", reward = "d"))
+    }
+    # make sure that the training data is sorted with increasing idoutcome
+    training <- arrange(training, idoutcome)
+
+    sa.count <- select(training, idstatefrom, idaction) %>% unique() %>% nrow()
+    out.count <- select(training, idoutcome) %>% unique() %>% nrow()
+    cat(sa.count, "state-actions,", out.count, "outcomes \n")
+
+
+    # TEST
+    # unzip and save the raw csv file to speed up loading of the file
+    cat("        Loading test file ... ")
+    test_file <- file.path(dir_path, "test.csv.xz")
+    stopifnot(file.exists(test_file))
+    if(file.size(test_file) < 10e6){
+        test <- read_csv(test_file, col_types =
+                                         cols(idstatefrom = "i", idaction = "i", idstateto = "i",
+                                                    idoutcome = "i", probability = "d", reward = "d"))
+    } else {
+        test_raw <- tools::file_path_sans_ext(test_file)
+        if(!file.exists(test_raw)) {
+            cat("            Large, decompressing using pixz ... \n")
+            system2("pixz", paste("-d -k", test_file))
+        }
+        test <- read_csv(test_raw, col_types =
+                                         cols(idstatefrom = "i", idaction = "i", idstateto = "i",
+                                                    idoutcome = "i", probability = "d", reward = "d"))
+    }
+    # make sure that the test data is sorted with increasing idoutcome
+    test <- arrange(test, idoutcome)
+
+    sa.count <- select(test, idstatefrom, idaction) %>% unique() %>% nrow()
+    out.count <- select(test, idoutcome) %>% unique() %>% nrow()
+    cat(sa.count, "state-actions,", out.count, "outcomes \n")
+
+    list(
+        discount = filter(parameters, parameter == "discount")$value[[1]],
+        initial_dist = initial,
+        true_mdp = true_mdp,
+        training_mdpo = training,
+        test_mdpo = test
+    )
+}
+
+
+## ------ Main Method ----------------
+
+#' Main evaluation function
+#'
+#' Runs all the algorithms over the domains and returns the summary of the results
+#'
+#' The result has one column for the domain, one column for the algorithms,
+#' and each statistic gets one column too.
+#'
+#' @param p List of paths to domain directories
+#' @param algorithms_paths List of paths to algorithm R implementation files
+#'
+#' @return Dataframe that contain the results
+main_eval <- function(p, algorithms_paths){
+
+    # This will contain the results, one column for domain name, algorithm name, and each statistic
+    results <- list()
+    iteration <- 1
+
+    if (file.exists(output_file)) {
+        results_old <- read_csv(output_file, col_types = cols())
+    }else{
+        results_old <- NULL
+    }
+
+    # check if the result already is in the csv file
+    has_result <- function(domain_n, algorithm_n, risk_w_n){
+        if (is.null(results_old)) {
+            FALSE
+        }else{
+            nrow(results_old %>%
+                 filter(domain == domain_n, algorithm == algorithm_n,
+                        risk_w == risk_w_n)) > 0
+        }
+    }
+
+    cat("Running algorithms ... \n")
+
+    # iterate over all domains
+
+    domain_spec <- load_domain(p)
+    # iterate over all risk weights
+
+
+    for (i_risk in seq_along(risk_weights_optimize)) {
+
+        # set the risk being used by the algorithm
+        params$risk_weight <- risk_weights_optimize[[i_risk]]
+
+        # iterate over all algorithms
+        for (i_alg in seq_along(algorithms_paths)) {
+            algorithm_name <- names(algorithms_paths[i_alg])
+
+            cat("    Running algorithm", algorithm_name, " ... \n")
+
+            # load the algorithm into its own separate environment
+            alg_env <- new.env() # make sure that algorithm runs are isolated as much as possible
+            sys.source(algorithms_paths[[i_alg]], alg_env, keep.source = TRUE,
+                           chdir = TRUE)
+
+            # call algorithm
+            # TODO: It would be good to detach and better isolate the execution
+            time_start <- Sys.time()
+            solution <- tryCatch(
+                {with(alg_env, {
+                    algorithm_main(domain_spec$training_mdpo, domain_spec$initial_dist,
+                                       domain_spec$discount) } ) },
+                error = function(e) {
+                    cat(" *** Error executing algorithm ****\n"); print(e)
+                    NULL
+                })
+            write_csv(solution$policy, file.path(p, paste(algorithm_name,as.character(i_risk),'solution.csv', sep="_")))
+            }
+        }
+    }
+
+print(p)
+main_eval(p, algorithms_paths)
